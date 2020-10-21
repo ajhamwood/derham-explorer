@@ -145,26 +145,67 @@ var app = new $.Machine({
   cvs: $('canvas')[0],
   ctx: $('canvas')[0].getContext('2d'),
   fps: 15,
+  initialPasses: 16,
   rendering: true,
   updating: false,
   scaleFac: 1,
   transOrg: null,
   tIndex: null,
   prevImg: null,
-  scaleMat: null,
-  oneMore: null
+  renderMat: null,
+  oneMore: null,
+  workers: [],
+  workerLoop:
+`let multMat = (A, B) => Array(A.length).fill(0).map(row =>
+      Array(B[0].length).fill(0)).map((row, i) => row.map((_, j) =>
+        A[i].reduce((sum, el, k) => sum + (el * B[k][j]), 0))),
+    d0 = (a, b, c, d) => (u, v) =>
+      multMat([[0, a, c], [0, b, d]], [[1], [u], [v]]).flat(),
+    d1 = (a, b, e, f) => (u, v) =>
+      multMat([[a, 1 - a, e], [b, -b, f]], [[1], [u], [v]]).flat(),
+    params, fn0, fn1, timing, prev = Infinity, tick, fps,
+    deRham = i => {
+      let res, next = [Math.random(), Math.random()];
+      for (let p = 0; p <= maxlvl; p++) {
+        res = next;
+        next = i % 2 ? fn0(...res) : fn1(...res);
+        i = i >> 1;
+      }
+      return res;
+    },
+    max, maxlvl, renderMat, step, n, updating = false, batch = [],
+    loopAlongCurve = (step, n) => Promise.resolve().then(() => {
+      if (n > max || updating) {
+        postMessage({ done: true, batch });
+        close()
+      } else {
+        let [a, b] = deRham(n);
+        batch.push(multMat(renderMat, [[1], [a], [b]]).flat())
+      }
+      if ((tick = (performance.now() - timing) % (1000 / fps)) < prev) {
+        prev = tick;
+        postMessage({ batch });
+        batch = [];
+        return new Promise(r => setTimeout(r, 0))
+      } else prev = tick;
+    }).then(() => loopAlongCurve(step, n + 2 * step));
+onmessage = e => {
+  ({ fps, step, n, params, maxlvl, renderMat, updating } =
+    Object.assign({ fps, step, n, params, maxlvl, renderMat, updating }, e.data));
+  if ('maxlvl' in e.data) max = 1 << maxlvl;
+  else if ('step' in e.data) {
+    timing = performance.now();
+    let [a, b, c, d, e, f] = params;
+    fn1 = d0(a, b, c, d);
+    fn0 = d1(a, b, e, f);
+    loopAlongCurve(step, n)
+  }
+}`
 });
 
 function multMat (A, B) {
   return Array(A.length).fill(0).map(row => Array(B[0].length).fill(0))
     .map((row, i) => row.map((_, j) => A[i].reduce((sum, el, k) => sum + (el * B[k][j]), 0)))
-}
-
-function d0 (a, b, c, d) {
-  return (u, v) => multMat([[0, a, c], [0, b, d]], [[1], [u], [v]]).flat()
-}
-function d1 (a, b, e, f) {
-  return (u, v) => multMat([[a, 1 - a, e], [b, -b, f]], [[1], [u], [v]]).flat()
 }
 
 // Events
@@ -179,7 +220,7 @@ $.targets({
       $('#params input').forEach((el, i) => el.value = this.params[i])
       this.cvs.width = document.body.clientWidth;
       this.cvs.height = document.body.clientHeight;
-      this.scaleMat = [
+      this.renderMat = [
         [this.cvs.width / 2 - this.cvs.height / 4, this.cvs.height / 2, 0],
         [3 * this.cvs.height / 4, 0, -this.cvs.height / 2]
       ];
@@ -189,6 +230,7 @@ $.targets({
     update () {
       this.params = $('#params input').map(el => el.valueAsNumber);
       this.updating = true;
+      this.workers.map(w => w.postMessage({ updating: true }));
       new Promise(r => setTimeout(r, 1000/this.fps)).then(() =>
         app.emit('run', $('#fam')[0].value)) //
     },
@@ -201,6 +243,7 @@ $.targets({
         this.prevImg.getContext('2d').drawImage(this.cvs, 0, 0)
       }
       this.updating = true;
+      this.workers.map(w => w.postMessage({ updating: true }));
     },
     endUpdating () {
       this.updating = false;
@@ -219,15 +262,15 @@ $.targets({
         (1 - this.scaleFac) * xorg, (1 - this.scaleFac) * yorg,
         this.scaleFac * this.cvs.width, this.scaleFac * this.cvs.height);
       new Promise(r => this.tIndex = setTimeout(r, 1000)).then(() => {
-        this.scaleMat = multMat(
+        this.renderMat = multMat(
           [[1, 0, 0], [-xorg, 1, 0], [-yorg, 0, 1]],
-          [[1, 0, 0]].concat(this.scaleMat));
-        this.scaleMat = multMat(
+          [[1, 0, 0]].concat(this.renderMat));
+        this.renderMat = multMat(
           [[1, 0, 0], [0, this.scaleFac, 0], [0, 0, this.scaleFac]],
-          this.scaleMat);
-        this.scaleMat = multMat(
+          this.renderMat);
+        this.renderMat = multMat(
           [[1, 0, 0], [xorg, 1, 0], [yorg, 0, 1]],
-          this.scaleMat).slice(1);
+          this.renderMat).slice(1);
         this.scaleFac = 1;
         app.emit('endUpdating')
       })
@@ -248,40 +291,31 @@ $.targets({
         e.layerY - this.transOrg.y)
     },
     endTranslate (e) {
-      this.scaleMat = multMat(
+      this.renderMat = multMat(
         [[1, 0, 0], [e.layerX - this.transOrg.x, 1, 0], [e.layerY - this.transOrg.y, 0, 1]],
-        [[1, 0, 0]].concat(this.scaleMat)).slice(1);
+        [[1, 0, 0]].concat(this.renderMat)).slice(1);
       this.transOrg = null;
-      $.queries({ canvas: { pointermove: 'pointermove', pointerup: 'pointerup' } })
+      $.queries({ canvas: { pointermove: 'pointermove', pointerup: 'pointerup' } });
       app.emit('endUpdating');
     },
 
     run (type) {
       $('button')[0].disabled = true;
       this.ctx.clearRect(0, 0, this.cvs.width, this.cvs.height);
-      let [a, b, c, d, e, f] = this.params;
+      let [a, b, c, d, e, f] = this.params, count = 0;
       switch (type) {
         case 'cesaro': this.params = [a, b, c = -b, d = a, e = b, f = 1 - a]; break
-        case 'koch': this.params = [a, b, c = b, d = -a, e = -b, f = a - 1]; break
+        case 'koch': this.params = [a, b, c = b, d = -a, e = -b, f = a - 1]
       }
       this.rendering = true;
       this.updating = false;
-      this.maxlvl = 16;
+      this.maxlvl = this.initialPasses;
       this.ctx.fillStyle = 'red';
-      let lvl = 0, max = 1 << this.maxlvl,
-          timing = performance.now(), prev = Infinity, tick,
+      let lvl = 0,
           tau = Math.PI * 2,
-          fn1 = d0(a, b, c, d), fn0 = d1(a, b, e, f),
-          deRham = i => {
-            let res, next = [Math.random(), Math.random()];
-            for (let p = 0; p <= this.maxlvl; p++) {
-              res = next;
-              next = i % 2 ? fn0(...res) : fn1(...res);
-              i = i >> 1;
-            }
-            return res;
-          },
           loopDepthPass = () => Promise.resolve().then(() => {
+            this.workers.forEach(w => w.terminate());
+            this.workers = [];
             if (++lvl > this.maxlvl) return new Promise(r => {
               $('button')[0].disabled = false;
               this.rendering = false;
@@ -290,51 +324,56 @@ $.targets({
               $('button')[0].disabled = true;
               this.rendering = true;
               this.oneMore = null;
-              max = 1 << ++this.maxlvl
+              ++this.maxlvl
             });
-          }).then((step = 1 << (this.maxlvl - lvl)) => loopAlongCurve(step, step))
-            .catch(() => { if (this.updating) throw '' })
-            .then(loopDepthPass),
-          loopAlongCurve = (step, n) => Promise.resolve().then(() => {
-            if (n > max) throw '';
-            else {
-              let [a, b] = deRham(n), coords = multMat(this.scaleMat, [[1], [a], [b]]).flat();
-              this.ctx.beginPath();
-              this.ctx.arc(...coords, .25, 0, tau, true);
-              this.ctx.fill();
-              if ((tick = (performance.now() - timing) % (1000/this.fps)) < prev) {
-                if (this.updating) throw '';
-                prev = tick;
-                return new Promise(r => requestAnimationFrame(r))
-              } else prev = tick;
-            }
-          }).then(() => loopAlongCurve(step, n + 2 * step))
-      return loopDepthPass().catch(() => this.rendering = false)
+          }).then(() => {
+              let step = 1 << (this.maxlvl - lvl),
+                  threads = navigator.hardwareConcurrency - 1 || 1,
+                  workers = Array(threads).fill(0)
+                    .map(() => {
+                      let w = new Worker(URL.createObjectURL(new Blob(
+                        [this.workerLoop], { type: 'application/javascript' })));
+                      this.workers.push(w);
+                      w.postMessage({
+                        fps: this.fps, maxlvl: this.maxlvl,
+                        renderMat: this.renderMat, params: [a, b, c, d, e, f] });
+                      return i => new Promise(r => {
+                        w.onmessage = e => {
+                          for (let coords of e.data.batch) {
+                            this.ctx.beginPath();
+                            this.ctx.arc(...coords, .25, 0, tau, true);
+                            this.ctx.fill();
+                          }
+                          if (e.data.done) r();
+                        };
+                        w.postMessage({ step: step * threads, n: 2 * step * (i + 1) });
+                      })
+                    });
+              return Promise.all(workers.map((w, i) => w(i)))
+            })
+            .then(loopDepthPass)
+      return loopDepthPass()
     }
   }
 });
 
 $.queries({
   canvas: { pointerdown (e) { app.emit('startTranslate', e) } },
-  '#fam': {
-    change (e) {
-      if (this.value === 'derham') $('#params > div').forEach(el => el.classList.remove('hide'));
-      else $('#params > div:nth-child(n+3)').forEach(el => el.classList.add('hide'));
-      app.emit('update')
+  '#fam': { change (e) {
+    if (this.value === 'derham') $('#params > div').forEach(el => el.classList.remove('hide'));
+    else $('#params > div:nth-child(n+3)').forEach(el => el.classList.add('hide'));
+    app.emit('update')
+  } },
+  '#presets': { change (e) {
+    switch (this.value) {
+      case 'none': return;
+      case 'levyc': $('#fam')[0].value = 'cesaro'; break;
+      case 'snowflake': case 'peano': $('#fam')[0].value = 'koch'; break;
+      default: $('#fam')[0].value = 'derham'
     }
-  },
-  '#presets': {
-    change (e) {
-      switch (this.value) {
-        case 'none': return;
-        case 'levyc': $('#fam')[0].value = 'cesaro'; break;
-        case 'snowflake': case 'peano': $('#fam')[0].value = 'koch'; break;
-        default: $('#fam')[0].value = 'derham'
-      }
-      $('input[type=number]').forEach((el, i) => el.value = app.state().presets[this.value][i]);
-      $('#fam')[0].dispatchEvent(new Event('change'))
-    }
-  },
+    $('input[type=number]').forEach((el, i) => el.value = app.state().presets[this.value][i]);
+    $('#fam')[0].dispatchEvent(new Event('change'))
+  } },
   'input[type=number]': { change (e) {
     $('#presets')[0].value = 'none';
     app.emit('update')
