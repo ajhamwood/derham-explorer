@@ -3,7 +3,7 @@
 <head>
   <title>de Rham fractal explorer</title>
   <meta charset='UTF-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=0'>
   <meta name='keywords' content='fractal, de Rham, curve, Koch snowflake, Blancmange curve, Lévy C-curve, Peano space-filling curve'>
   <meta name='description' content='Generate beautiful renderings of de Rham fractals.'>
   <link rel='icon' type='image/x-icon' href='data:image/x-icon;base64,'>
@@ -148,8 +148,9 @@ var app = new $.Machine({
   initialPasses: 16,
   rendering: true,
   updating: false,
-  scaleFac: 1,
   transOrg: null,
+  scaleUnit: null,
+  scaleFac: 1,
   tIndex: null,
   prevImg: null,
   renderMat: null,
@@ -169,7 +170,7 @@ var app = new $.Machine({
       for (let p = 0; p <= maxlvl; p++) {
         res = next;
         next = i % 2 ? fn0(...res) : fn1(...res);
-        i = i >> 1;
+        i >>= 1;
       }
       return res;
     },
@@ -207,13 +208,22 @@ function multMat (A, B) {
   return Array(A.length).fill(0).map(row => Array(B[0].length).fill(0))
     .map((row, i) => row.map((_, j) => A[i].reduce((sum, el, k) => sum + (el * B[k][j]), 0)))
 }
+function translate (M, x, y) {
+  return multMat([[1, 0, 0], [x, 1, 0], [y, 0, 1]], [[1, 0, 0]].concat(M)).slice(1)
+}
+function scale (M, u) {
+  return multMat([[1, 0, 0], [0, u, 0], [0, 0, u]], [[1, 0, 0]].concat(M)).slice(1)
+}
 
 // Events
 $.targets({
   load () { app.emit('init') },
-  wheel (e) { app.emit('scale', e) },
+  wheel (e) { app.emit('scrollScale', e) },
   app: {
     init () {
+      if (navigator.maxTouchPoints > 1)
+        $.queries({ canvas: { touchstart (e) { app.emit('startTransform', e) } } });
+      else $.queries({ canvas: { pointerdown (e) { app.emit('startTranslate', e) } } });
       $('#presets')[0].value = 'none';
       let select = $('#fam')[0];
       select.value = 'koch';
@@ -252,7 +262,7 @@ $.targets({
       app.emit('run', $('#fam')[0].value)
     },
 
-    scale (e) {
+    scrollScale (e) {
       let xorg = this.cvs.width / 2, yorg = this.cvs.height / 2;
       app.emit('startUpdating');
       this.scaleFac *= 1 + e.deltaY / 100;
@@ -262,15 +272,9 @@ $.targets({
         (1 - this.scaleFac) * xorg, (1 - this.scaleFac) * yorg,
         this.scaleFac * this.cvs.width, this.scaleFac * this.cvs.height);
       new Promise(r => this.tIndex = setTimeout(r, 1000)).then(() => {
-        this.renderMat = multMat(
-          [[1, 0, 0], [-xorg, 1, 0], [-yorg, 0, 1]],
-          [[1, 0, 0]].concat(this.renderMat));
-        this.renderMat = multMat(
-          [[1, 0, 0], [0, this.scaleFac, 0], [0, 0, this.scaleFac]],
-          this.renderMat);
-        this.renderMat = multMat(
-          [[1, 0, 0], [xorg, 1, 0], [yorg, 0, 1]],
-          this.renderMat).slice(1);
+        this.renderMat = translate(this.renderMat, -xorg, -yorg);
+        this.renderMat = scale(this.renderMat, this.scaleFac);
+        this.renderMat = translate(this.renderMat, xorg, yorg);
         this.scaleFac = 1;
         app.emit('endUpdating')
       })
@@ -278,7 +282,7 @@ $.targets({
 
     startTranslate (e) {
       app.emit('startUpdating');
-      this.transOrg = { x: e.layerX, y: e.layerY };
+      this.transOrg = { x: e.clientX, y: e.clientY };
       $.queries({ canvas: {
         pointermove (e) { app.emit('translate', e) },
         pointerup (e) { app.emit('endTranslate', e) }
@@ -287,15 +291,63 @@ $.targets({
     translate (e) {
       this.ctx.clearRect(0, 0, this.cvs.width, this.cvs.height);
       this.ctx.drawImage(this.prevImg,
-        e.layerX - this.transOrg.x,
-        e.layerY - this.transOrg.y)
+        e.clientX - this.transOrg.x, e.clientY - this.transOrg.y)
     },
     endTranslate (e) {
-      this.renderMat = multMat(
-        [[1, 0, 0], [e.layerX - this.transOrg.x, 1, 0], [e.layerY - this.transOrg.y, 0, 1]],
-        [[1, 0, 0]].concat(this.renderMat)).slice(1);
+      this.renderMat = translate(this.renderMat,
+        e.clientX - this.transOrg.x, e.clientY - this.transOrg.y);
       this.transOrg = null;
       $.queries({ canvas: { pointermove: 'pointermove', pointerup: 'pointerup' } });
+      app.emit('endUpdating');
+    },
+
+    startTransform (e) {
+      app.emit('startUpdating');
+      let ts = e.touches;
+      if (ts.length === 1) this.transOrg = { x: ts[0].clientX, y: ts[0].clientY };
+      else if (ts.length > 1) {
+        this.transOrg = { x: (ts[0].clientX + ts[1].clientX) / 2,
+          y: (ts[0].clientY + ts[1].clientY) / 2 };
+        this.scaleUnit = { u: Math.sqrt(Math.pow(ts[0].clientX - ts[1].clientX, 2) +
+          Math.pow(ts[0].clientY - ts[1].clientY, 2)) };
+      }
+      $.queries({ canvas: {
+        touchmove (e) { app.emit('transform', e) },
+        touchend (e) { app.emit('endTransform', e) }
+      } })
+    },
+    transform (e) {
+      let ts = e.touches;
+      this.ctx.clearRect(0, 0, this.cvs.width, this.cvs.height);
+      if (this.scaleUnit) {
+        this.transOrg.x1 = (ts[0].clientX + ts[1].clientX) / 2;
+        this.transOrg.y1 = (ts[0].clientY + ts[1].clientY) / 2;
+        this.scaleUnit.u1 = Math.sqrt(Math.pow(ts[0].clientX - ts[1].clientX, 2) +
+        Math.pow(ts[0].clientY - ts[1].clientY, 2));
+        let fact = this.scaleUnit.u1 / this.scaleUnit.u;
+        this.ctx.drawImage(this.prevImg,
+          this.transOrg.x1 - this.transOrg.x + (1 - fact) * this.cvs.width / 2,
+          this.transOrg.y1 - this.transOrg.y + (1 - fact) * this.cvs.height / 2,
+          this.cvs.width * fact, this.cvs.height * fact)
+      } else {
+        this.transOrg.x1 = ts[0].clientX;
+        this.transOrg.y1 = ts[0].clientY;
+        this.ctx.drawImage(this.prevImg, this.transOrg.x1 - this.transOrg.x,
+          this.transOrg.y1 - this.transOrg.y)
+      }
+    },
+    endTransform (e) {
+      if (this.scaleUnit) {
+        let xorg = this.cvs.width / 2, yorg = this.cvs.height / 2;
+        this.renderMat = translate(this.renderMat, -xorg, -yorg);
+        this.renderMat = scale(this.renderMat, this.scaleUnit.u1 / this.scaleUnit.u);
+        this.renderMat = translate(this.renderMat,
+          xorg + this.transOrg.x1 - this.transOrg.x, yorg + this.transOrg.y1 - this.transOrg.y);
+        this.scaleUnit = null;
+      } else this.renderMat = translate(this.renderMat,
+        this.transOrg.x1 - this.transOrg.x, this.transOrg.y1 - this.transOrg.y);
+      this.transOrg = null;
+      $.queries({ canvas: { touchmove: 'touchmove', touchend: 'touchend' } });
       app.emit('endUpdating');
     },
 
@@ -358,7 +410,6 @@ $.targets({
 });
 
 $.queries({
-  canvas: { pointerdown (e) { app.emit('startTranslate', e) } },
   '#fam': { change (e) {
     if (this.value === 'derham') $('#params > div').forEach(el => el.classList.remove('hide'));
     else $('#params > div:nth-child(n+3)').forEach(el => el.classList.add('hide'));
